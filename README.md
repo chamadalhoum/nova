@@ -378,3 +378,56 @@ After user confirmation, tasks created from chat use `CONFIRMED`. The task histo
 - Web currently stores tokens in session storage for development; production should use httpOnly secure cookies with CSRF protection where required
 - Shared API types live in `packages/contracts` and are imported by web/mobile as `@nova/contracts`
 - Alembic has an explicit initial MVP schema migration; run migrations explicitly before production database use
+
+## NOVA V0.7 Admin And Observability
+
+V0.7 adds a small server-authorized admin surface for operational visibility.
+
+Admin authorization:
+
+- Users have an explicit `role` column. Normal users default to `user`; admins use `admin`.
+- Admin APIs are protected server-side with the same JWT authentication flow plus an admin-role check.
+- Normal users receive `403 Admin access required` for `/api/v1/admin/...` endpoints.
+- There is no public self-promotion endpoint. Admin role assignment is an explicit operational CLI action.
+
+Promote an existing user to admin:
+
+```bash
+cd /home/databiz194/Bureau/formation/NOVA/backend
+python -m app.cli promote-admin --email user@example.com
+```
+
+The command only promotes an existing user. It is idempotent for users who are already admin, returns a safe `not_found` result for unknown users, and never prints passwords, token hashes, or JWTs.
+
+Migration behavior:
+
+- Fresh databases create users with `role="user"` by default.
+- Existing databases get `users.role` through Alembic migration `0002_add_user_role`, backfilled to `user`.
+- Admin promotion does not require manual SQL.
+
+Admin API endpoints:
+
+```text
+GET /api/v1/admin/dashboard
+GET /api/v1/admin/users
+GET /api/v1/admin/users/{id}
+GET /api/v1/admin/tasks
+GET /api/v1/admin/service-requests
+GET /api/v1/admin/providers
+GET /api/v1/admin/audit-logs
+GET /api/v1/admin/analytics
+GET /api/v1/admin/ai-events
+```
+
+Admin list endpoints use `limit` and `offset` pagination with a maximum limit of `100`.
+
+AI observability exposes sanitized operational metadata only: provider, model, latency, success/failure, fallback usage, error type, intent, confidence, and token usage when available. It does not expose raw prompts, full entities, proposed task payloads, API keys, or private user content.
+
+The admin web area lives under `/admin` in the existing Next.js app. It is an operational UI only; backend authorization remains authoritative.
+
+Pipeline idempotency:
+
+- Repeating task start, completion, or cancellation after the task is already in that final state returns the current task instead of adding duplicate timeline events.
+- Repeating provider selection for the same current task/provider reuses the existing prepared or confirmed service request.
+- Repeating task-scoped service request preparation for the same provider reuses the current request.
+- Service request confirmation remains idempotent once the request is already `CONFIRMED`.

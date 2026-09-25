@@ -1,12 +1,12 @@
 import hashlib
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import and_, func, select, update
 from sqlalchemy.orm import Session
 
 from app.ai.pipeline import NovaAIPipeline
-from app.auth.dependencies import get_current_user
+from app.auth.dependencies import get_current_user, require_admin_user
 from app.capabilities.registry import CapabilityError, capability_registry
 from app.common.http import iso
 from app.core.config import settings
@@ -38,6 +38,8 @@ from app.models import (
     UserPreference,
 )
 from app.schemas import (
+    AdminDashboardOut,
+    AdminPage,
     AIMessageResponse,
     AssetCreate,
     AssetOut,
@@ -129,6 +131,7 @@ def user_out(user: User) -> UserOut:
         full_name=user.full_name,
         locale=user.locale,
         timezone=user.timezone,
+        role=user.role,
     )
 
 
@@ -559,6 +562,8 @@ def start_task(
     task_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> TaskOut:
     task = get_owned_task(db, user, task_id)
+    if task.status == "IN_PROGRESS":
+        return task_out(db, task)
     transition_task(db, task, "IN_PROGRESS", "started", "Task started.")
     db.commit()
     db.refresh(task)
@@ -612,6 +617,8 @@ def complete_task(
     task_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> TaskOut:
     task = get_owned_task(db, user, task_id)
+    if task.status == "COMPLETED":
+        return task_out(db, task)
     transition_task(db, task, "COMPLETED", "completed", "Task marked as completed.")
     track_product_event(db, user.id, "task_completed", {"task_id": task.id})
     db.commit()
@@ -624,6 +631,8 @@ def cancel_task(
     task_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> TaskOut:
     task = get_owned_task(db, user, task_id)
+    if task.status == "CANCELLED":
+        return task_out(db, task)
     transition_task(db, task, "CANCELLED", "cancelled", "Task cancelled.")
     db.commit()
     db.refresh(task)
@@ -900,6 +909,18 @@ def select_provider_for_task(
     provider = validate_provider_for_service(db, payload.provider_id, category, location)
     when = task.due_date
     task_data = dict(task.data or {})
+    current_request = task_data.get("service_request") or {}
+    current_request_id = current_request.get("id")
+    if current_request_id:
+        existing_request = db.get(ServiceRequest, current_request_id)
+        if (
+            existing_request is not None
+            and existing_request.user_id == user.id
+            and existing_request.task_id == task.id
+            and existing_request.provider_id == provider.id
+            and existing_request.status in {"PREPARED", "CONFIRMED"}
+        ):
+            return task_out(db, task)
     request = ServiceRequest(
         user_id=user.id,
         task_id=task.id,
@@ -990,6 +1011,25 @@ def create_service_request(
     except CapabilityError as exc:
         raise capability_http_error(exc) from exc
     provider = validate_provider_for_service(db, payload.provider_id, category, str(location)) if payload.provider_id else None
+    if payload.task_id:
+        current_request = (task.data or {}).get("service_request") or {}
+        current_request_id = current_request.get("id")
+        if current_request_id:
+            existing_request = db.get(ServiceRequest, current_request_id)
+            if (
+                existing_request is not None
+                and existing_request.user_id == user.id
+                and existing_request.task_id == task.id
+                and existing_request.provider_id == payload.provider_id
+                and existing_request.status in {"PREPARED", "CONFIRMED"}
+            ):
+                return {
+                    "id": existing_request.id,
+                    "status": existing_request.status,
+                    "risk_level": existing_request.risk_level,
+                    "message": "Service request already prepared. No external provider was contacted or booked.",
+                    "data": existing_request.data,
+                }
     request = ServiceRequest(
         user_id=user.id,
         task_id=payload.task_id,
@@ -1152,6 +1192,280 @@ def create_asset(
 def list_assets(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[AssetOut]:
     assets = db.scalars(select(Asset).where(Asset.user_id == user.id).order_by(Asset.created_at.desc())).all()
     return [AssetOut(**asset.__dict__) for asset in assets]
+
+
+def admin_page(limit: int = Query(default=50, ge=1, le=100), offset: int = Query(default=0, ge=0)) -> tuple[int, int]:
+    return limit, offset
+
+
+SAFE_AUDIT_KEYS = {
+    "provider",
+    "model",
+    "latency_ms",
+    "success",
+    "fallback_used",
+    "error_type",
+    "intent",
+    "category",
+    "language",
+    "confidence",
+    "missing_fields",
+    "token_usage",
+    "conversation_id",
+    "task_id",
+    "service_request_id",
+    "provider_id",
+    "source",
+    "locale",
+    "status",
+    "has_location",
+    "result_count",
+    "is_demo",
+}
+
+
+def safe_audit_data(data: dict) -> dict:
+    return {key: value for key, value in (data or {}).items() if key in SAFE_AUDIT_KEYS}
+
+
+def page_from_query(db: Session, query, count_query, limit: int, offset: int, serializer) -> AdminPage:
+    total = db.scalar(count_query) or 0
+    items = db.scalars(query.limit(limit).offset(offset)).all()
+    return AdminPage(items=[serializer(item) for item in items], limit=limit, offset=offset, total=total)
+
+
+def admin_user_item(user: User) -> dict:
+    return {
+        "id": user.id,
+        "email": user.email,
+        "full_name": user.full_name,
+        "locale": user.locale,
+        "timezone": user.timezone,
+        "role": user.role,
+        "is_active": user.is_active,
+        "created_at": iso(user.created_at),
+        "updated_at": iso(user.updated_at),
+    }
+
+
+def admin_task_item(task: Task) -> dict:
+    return {
+        "id": task.id,
+        "user_id": task.user_id,
+        "conversation_id": task.conversation_id,
+        "title": task.title,
+        "category": task.category,
+        "intent": task.intent,
+        "status": task.status,
+        "priority": task.priority,
+        "due_date": task.due_date,
+        "created_at": iso(task.created_at),
+        "updated_at": iso(task.updated_at),
+    }
+
+
+def admin_service_request_item(item: ServiceRequest) -> dict:
+    return {
+        "id": item.id,
+        "user_id": item.user_id,
+        "task_id": item.task_id,
+        "provider_id": item.provider_id,
+        "status": item.status,
+        "risk_level": item.risk_level,
+        "external_action_executed": bool((item.data or {}).get("external_action_executed")),
+        "category": (item.data or {}).get("category"),
+        "location": (item.data or {}).get("location"),
+        "created_at": iso(item.created_at),
+        "updated_at": iso(item.updated_at),
+    }
+
+
+def admin_provider_item(item: Provider) -> dict:
+    return {
+        "id": item.id,
+        "name": item.name,
+        "description": item.description,
+        "location": item.location,
+        "verified": item.verified,
+        "demo": item.demo,
+        "rating": item.rating,
+        "review_count": item.review_count,
+        "created_at": iso(item.created_at),
+        "updated_at": iso(item.updated_at),
+    }
+
+
+def admin_audit_item(item: AuditLog) -> dict:
+    return {
+        "id": item.id,
+        "user_id": item.user_id,
+        "action": item.action,
+        "data": safe_audit_data(item.data or {}),
+        "created_at": iso(item.created_at),
+    }
+
+
+@router.get("/admin/dashboard", response_model=AdminDashboardOut)
+def admin_dashboard(
+    admin: User = Depends(require_admin_user),
+    db: Session = Depends(get_db),
+) -> AdminDashboardOut:
+    recent_cutoff = datetime.now(UTC) - timedelta(days=7)
+    status_rows = db.execute(select(Task.status, func.count()).group_by(Task.status)).all()
+    tasks_by_status = {status_name: count for status_name, count in status_rows}
+    ai_intent_events = db.scalar(select(func.count()).select_from(AuditLog).where(AuditLog.action == "ai.intent_processed")) or 0
+    fallback_events = db.scalar(
+        select(func.count()).select_from(AuditLog).where(
+            AuditLog.action == "ai.intent_processed",
+            AuditLog.data["fallback_used"].as_boolean().is_(True),
+        )
+    ) or 0
+    return AdminDashboardOut(
+        total_users=db.scalar(select(func.count()).select_from(User)) or 0,
+        users_created_recently=db.scalar(select(func.count()).select_from(User).where(User.created_at >= recent_cutoff)) or 0,
+        total_tasks=db.scalar(select(func.count()).select_from(Task)) or 0,
+        tasks_by_status=tasks_by_status,
+        completed_tasks=tasks_by_status.get("COMPLETED", 0),
+        service_requests=db.scalar(select(func.count()).select_from(ServiceRequest)) or 0,
+        confirmed_service_requests=db.scalar(select(func.count()).select_from(ServiceRequest).where(ServiceRequest.status == "CONFIRMED")) or 0,
+        provider_selections=db.scalar(select(func.count()).select_from(AuditLog).where(AuditLog.action == "product.provider_selected")) or 0,
+        ai_intent_events=ai_intent_events,
+        clarification_events=db.scalar(select(func.count()).select_from(AuditLog).where(AuditLog.action == "product.clarification_requested")) or 0,
+        fallback_events=fallback_events,
+        unavailable_metrics=["real_provider_bookings", "payments", "external_provider_contacts"],
+    )
+
+
+@router.get("/admin/users", response_model=AdminPage)
+def admin_users(
+    pagination: tuple[int, int] = Depends(admin_page),
+    role: str | None = Query(default=None, max_length=32),
+    admin: User = Depends(require_admin_user),
+    db: Session = Depends(get_db),
+) -> AdminPage:
+    limit, offset = pagination
+    query = select(User).order_by(User.created_at.desc(), User.id.asc())
+    count_query = select(func.count()).select_from(User)
+    if role:
+        query = query.where(User.role == role)
+        count_query = count_query.where(User.role == role)
+    return page_from_query(db, query, count_query, limit, offset, admin_user_item)
+
+
+@router.get("/admin/users/{user_id}")
+def admin_user_detail(
+    user_id: str,
+    admin: User = Depends(require_admin_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    item = db.get(User, user_id)
+    if item is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    return admin_user_item(item)
+
+
+@router.get("/admin/tasks", response_model=AdminPage)
+def admin_tasks(
+    pagination: tuple[int, int] = Depends(admin_page),
+    status_filter: str | None = Query(default=None, alias="status", max_length=40),
+    user_id: str | None = Query(default=None, max_length=36),
+    admin: User = Depends(require_admin_user),
+    db: Session = Depends(get_db),
+) -> AdminPage:
+    limit, offset = pagination
+    query = select(Task).order_by(Task.created_at.desc(), Task.id.asc())
+    count_query = select(func.count()).select_from(Task)
+    if status_filter:
+        query = query.where(Task.status == status_filter)
+        count_query = count_query.where(Task.status == status_filter)
+    if user_id:
+        query = query.where(Task.user_id == user_id)
+        count_query = count_query.where(Task.user_id == user_id)
+    return page_from_query(db, query, count_query, limit, offset, admin_task_item)
+
+
+@router.get("/admin/service-requests", response_model=AdminPage)
+def admin_service_requests(
+    pagination: tuple[int, int] = Depends(admin_page),
+    status_filter: str | None = Query(default=None, alias="status", max_length=40),
+    user_id: str | None = Query(default=None, max_length=36),
+    admin: User = Depends(require_admin_user),
+    db: Session = Depends(get_db),
+) -> AdminPage:
+    limit, offset = pagination
+    query = select(ServiceRequest).order_by(ServiceRequest.created_at.desc(), ServiceRequest.id.asc())
+    count_query = select(func.count()).select_from(ServiceRequest)
+    if status_filter:
+        query = query.where(ServiceRequest.status == status_filter)
+        count_query = count_query.where(ServiceRequest.status == status_filter)
+    if user_id:
+        query = query.where(ServiceRequest.user_id == user_id)
+        count_query = count_query.where(ServiceRequest.user_id == user_id)
+    return page_from_query(db, query, count_query, limit, offset, admin_service_request_item)
+
+
+@router.get("/admin/providers", response_model=AdminPage)
+def admin_providers(
+    pagination: tuple[int, int] = Depends(admin_page),
+    demo: bool | None = Query(default=None),
+    admin: User = Depends(require_admin_user),
+    db: Session = Depends(get_db),
+) -> AdminPage:
+    limit, offset = pagination
+    query = select(Provider).order_by(Provider.name.asc(), Provider.id.asc())
+    count_query = select(func.count()).select_from(Provider)
+    if demo is not None:
+        query = query.where(Provider.demo.is_(demo))
+        count_query = count_query.where(Provider.demo.is_(demo))
+    return page_from_query(db, query, count_query, limit, offset, admin_provider_item)
+
+
+@router.get("/admin/audit-logs", response_model=AdminPage)
+def admin_audit_logs(
+    pagination: tuple[int, int] = Depends(admin_page),
+    action: str | None = Query(default=None, max_length=120),
+    user_id: str | None = Query(default=None, max_length=36),
+    admin: User = Depends(require_admin_user),
+    db: Session = Depends(get_db),
+) -> AdminPage:
+    limit, offset = pagination
+    query = select(AuditLog).order_by(AuditLog.created_at.desc(), AuditLog.id.asc())
+    count_query = select(func.count()).select_from(AuditLog)
+    if action:
+        query = query.where(AuditLog.action == action)
+        count_query = count_query.where(AuditLog.action == action)
+    if user_id:
+        query = query.where(AuditLog.user_id == user_id)
+        count_query = count_query.where(AuditLog.user_id == user_id)
+    return page_from_query(db, query, count_query, limit, offset, admin_audit_item)
+
+
+@router.get("/admin/analytics", response_model=AdminPage)
+def admin_analytics(
+    pagination: tuple[int, int] = Depends(admin_page),
+    action: str | None = Query(default=None, max_length=120),
+    admin: User = Depends(require_admin_user),
+    db: Session = Depends(get_db),
+) -> AdminPage:
+    limit, offset = pagination
+    query = select(AuditLog).where(AuditLog.action.like("product.%")).order_by(AuditLog.created_at.desc(), AuditLog.id.asc())
+    count_query = select(func.count()).select_from(AuditLog).where(AuditLog.action.like("product.%"))
+    if action:
+        query = query.where(AuditLog.action == action)
+        count_query = count_query.where(AuditLog.action == action)
+    return page_from_query(db, query, count_query, limit, offset, admin_audit_item)
+
+
+@router.get("/admin/ai-events", response_model=AdminPage)
+def admin_ai_events(
+    pagination: tuple[int, int] = Depends(admin_page),
+    admin: User = Depends(require_admin_user),
+    db: Session = Depends(get_db),
+) -> AdminPage:
+    limit, offset = pagination
+    query = select(AuditLog).where(AuditLog.action.like("ai.%")).order_by(AuditLog.created_at.desc(), AuditLog.id.asc())
+    count_query = select(func.count()).select_from(AuditLog).where(AuditLog.action.like("ai.%"))
+    return page_from_query(db, query, count_query, limit, offset, admin_audit_item)
 
 
 @router.get("/health")

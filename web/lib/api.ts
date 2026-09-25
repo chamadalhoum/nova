@@ -1,5 +1,12 @@
 import type {
   NovaApiErrorBody,
+  NovaAdminAuditLog,
+  NovaAdminDashboard,
+  NovaAdminPage,
+  NovaAdminProvider,
+  NovaAdminServiceRequest,
+  NovaAdminTask,
+  NovaAdminUser,
   NovaCapability,
   NovaProvider,
   NovaServiceDiscoveryResponse,
@@ -16,6 +23,20 @@ export type Provider = NovaProvider;
 export type Capability = NovaCapability;
 export type ServiceDiscoveryResponse = NovaServiceDiscoveryResponse;
 export type ServiceRequest = NovaServiceRequest;
+export type AdminPage<T> = NovaAdminPage<T>;
+export type AdminDashboard = NovaAdminDashboard;
+export type AdminUser = NovaAdminUser;
+export type AdminTask = NovaAdminTask;
+export type AdminServiceRequest = NovaAdminServiceRequest;
+export type AdminProvider = NovaAdminProvider;
+export type AdminAuditLog = NovaAdminAuditLog;
+
+export class ApiError extends Error {
+  constructor(message: string, public status: number, public requestId: string | null) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
 
 export function getAccessToken() {
   if (typeof window === "undefined") return null;
@@ -87,10 +108,13 @@ export async function apiFetch<T>(path: string, init: RequestInit = {}, retry = 
   }
   if (!response.ok) {
     let message = "NOVA could not complete this request. Please try again.";
+    let requestId = response.headers.get("X-Request-ID");
     try {
-      message = messageFromErrorBody(await response.json() as Partial<NovaApiErrorBody> & { detail?: unknown }, message);
+      const body = await response.json() as Partial<NovaApiErrorBody> & { detail?: unknown };
+      requestId = body.error?.request_id || requestId;
+      message = messageFromErrorBody(body, message);
     } catch {}
-    throw new Error(message);
+    throw new ApiError(message, response.status, requestId);
   }
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;

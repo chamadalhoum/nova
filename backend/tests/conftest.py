@@ -2,6 +2,7 @@ import os
 from collections.abc import Generator
 
 os.environ["DATABASE_URL"] = "sqlite:///./test_nova.db"
+os.environ["REDIS_URL"] = "redis://localhost:6390/15"
 os.environ["JWT_SECRET"] = "test-access-secret-long"
 os.environ["JWT_REFRESH_SECRET"] = "test-refresh-secret-long"
 

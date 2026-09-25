@@ -190,6 +190,7 @@ export interface NovaUser {
   full_name: string | null;
   locale: string;
   timezone: string;
+  role: "user" | "admin" | string;
 }
 
 export interface NovaConversation {
@@ -255,4 +256,87 @@ export interface NovaApiErrorBody {
     request_id: string;
   };
   detail?: string | Record<string, unknown> | Array<Record<string, unknown>>;
+}
+
+export interface NovaAdminPage<T> {
+  items: T[];
+  limit: number;
+  offset: number;
+  total: number;
+}
+
+export interface NovaAdminDashboard {
+  total_users: number;
+  users_created_recently: number;
+  total_tasks: number;
+  tasks_by_status: Record<string, number>;
+  completed_tasks: number;
+  service_requests: number;
+  confirmed_service_requests: number;
+  provider_selections: number;
+  ai_intent_events: number;
+  clarification_events: number;
+  fallback_events: number;
+  unavailable_metrics: string[];
+}
+
+export interface NovaAdminUser {
+  id: string;
+  email: string;
+  full_name: string | null;
+  locale: string;
+  timezone: string;
+  role: "user" | "admin" | string;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface NovaAdminTask {
+  id: string;
+  user_id: string;
+  conversation_id: string | null;
+  title: string;
+  category: string;
+  intent: string;
+  status: TaskStatus | string;
+  priority: string;
+  due_date: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface NovaAdminServiceRequest {
+  id: string;
+  user_id: string;
+  task_id: string | null;
+  provider_id: string | null;
+  status: ServiceRequestStatus;
+  risk_level: RiskLevel;
+  external_action_executed: boolean;
+  category?: string | null;
+  location?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface NovaAdminProvider {
+  id: string;
+  name: string;
+  description: string;
+  location: string;
+  verified: boolean;
+  demo: boolean;
+  rating: number | null;
+  review_count: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface NovaAdminAuditLog {
+  id: string;
+  user_id: string | null;
+  action: string;
+  data: Record<string, unknown>;
+  created_at: string;
 }

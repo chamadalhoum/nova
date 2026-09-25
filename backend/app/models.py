@@ -33,6 +33,7 @@ class User(Base, TimestampMixin):
     locale: Mapped[str] = mapped_column(String(16), default="en")
     timezone: Mapped[str] = mapped_column(String(64), default="UTC")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    role: Mapped[str] = mapped_column(String(32), default="user", index=True)
 
     preferences: Mapped["UserPreference | None"] = relationship(back_populates="user")
 

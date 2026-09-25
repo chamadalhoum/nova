@@ -72,6 +72,30 @@ V0.6 contract notes:
 - Every API response should include `X-Request-ID`. A valid incoming `X-Request-ID` may be reused; otherwise the backend generates one.
 - Add contract drift tests when changing task statuses, task event names, provider/service request response shapes, or the API error envelope.
 
+V0.7 admin and observability notes:
+- Admin access is a backend authorization concern. Do not rely on Next.js route visibility or client-side checks for admin security.
+- Admin endpoints must use `require_admin_user` and return `403` for authenticated non-admin users.
+- Do not expose password hashes, refresh token hashes, raw prompts, full conversation content, full entities, proposed task payloads, API keys, or external provider secrets through admin endpoints.
+- Admin audit and AI endpoints should use sanitized `AuditLog` data only. Expand `SAFE_AUDIT_KEYS` deliberately and add tests when exposing a new field.
+- User-owned endpoints such as `/tasks/{id}`, `/conversations/{id}`, `/memories`, `/assets`, and `/service-requests/{id}` must keep ownership checks even when the caller has an admin role. Use dedicated admin endpoints for cross-user inspection.
+- Keep task events lowercase and product-stable. Do not add a second event system for admin views.
+- Promote existing users with `python -m app.cli promote-admin --email user@example.com` from `backend/`. Do not add a public admin-promotion endpoint.
+- The promotion CLI must remain explicit, idempotent, and non-secret-bearing. It may return `promoted`, `already_admin`, `not_found`, or `invalid_input`.
+- Migration `0002_add_user_role` backfills existing users to `user`; no existing user becomes admin automatically.
+
+Execution pipeline review:
+- Current flow is synchronous: user message -> conversation -> AI pipeline -> intent/context -> clarification or task plan -> explicit confirmation -> task -> capability -> demo service discovery -> provider selection -> internal service request -> task timeline.
+- Business-rule transitions are backend validated through Pydantic schemas, capability validation, ownership helpers, task state transitions, provider/category/location validation, and explicit service-request confirmation.
+- Auditable records already exist through task events, tool executions, and sanitized audit/product events.
+- Operations that could eventually move to background jobs are live AI classification, notification delivery, analytics aggregation, and future external provider contact. V0.7 intentionally keeps them synchronous because no worker architecture exists yet and no real external integration is connected.
+- Repeated client requests should not create duplicate side effects. Task start/complete/cancel, same-provider task selection, task-scoped service request preparation, and service request confirmation are idempotent for the already-achieved state.
+- Concurrent write hardening is still lightweight. If NOVA adds real external actions later, add stronger database-level constraints or idempotency keys before contacting external systems.
+
+Pipeline traceability:
+- Request IDs are attached to every HTTP response through `X-Request-ID` and error envelopes.
+- Conversation AI turns create sanitized `ai.intent_processed` audit logs with provider/model/latency/success/fallback/error/intent/confidence/token usage where available.
+- Task creation, service discovery, provider selection, service request preparation/confirmation, and task completion create task events, tool executions, or product audit events without storing raw prompts in analytics.
+
 Local setup guardrails:
 - Run setup commands from `/home/databiz194/Bureau/formation/NOVA` before entering `backend/`, `web/`, or `mobile/`.
 - Docker Compose loads `.env`, not `.env.example`. Create it with `cp .env.example .env` and change JWT secrets before sharing or deploying.

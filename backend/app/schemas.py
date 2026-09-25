@@ -29,6 +29,7 @@ class UserOut(BaseModel):
     full_name: str | None
     locale: str
     timezone: str
+    role: str
 
 
 class UserUpdate(BaseModel):
@@ -236,3 +237,25 @@ class AssetOut(BaseModel):
     brand: str | None
     model: str | None
     notes: str | None
+
+
+class AdminPage(BaseModel):
+    items: list[dict]
+    limit: int
+    offset: int
+    total: int
+
+
+class AdminDashboardOut(BaseModel):
+    total_users: int
+    users_created_recently: int
+    total_tasks: int
+    tasks_by_status: dict[str, int]
+    completed_tasks: int
+    service_requests: int
+    confirmed_service_requests: int
+    provider_selections: int
+    ai_intent_events: int
+    clarification_events: int
+    fallback_events: int
+    unavailable_metrics: list[str]
