@@ -12,7 +12,14 @@ test("complete demo service request flow", async ({ page }) => {
 
   await page.goto("/chat");
   await page.getByLabel("Write what you need").fill("I need AC repair in Ariana tomorrow");
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "request-notes.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("The AC unit is in the living room."),
+  });
+  await expect(page.getByText("request-notes.txt")).toBeVisible();
   await page.getByRole("button", { name: "Send" }).click();
+  await expect(page.getByText("Uploaded: request-notes.txt")).toBeVisible();
   await expect(page.getByText("Service: air conditioning")).toBeVisible();
   await expect(page.getByText("Area: Ariana")).toBeVisible();
   await expect(page.getByText("No booking or provider contact will happen yet.")).toBeVisible();

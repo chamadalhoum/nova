@@ -95,6 +95,9 @@ class AIExecutionMetadata(BaseModel):
     fallback_used: bool = False
     error_type: str | None = None
     token_usage: dict[str, int | None] | None = None
+    prompt_version: str = "intent-v1"
+    fallback_from_provider: str | None = None
+    total_latency_ms: int | None = None
 
 
 class TaskPlan(BaseModel):

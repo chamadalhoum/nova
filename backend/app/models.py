@@ -1,7 +1,18 @@
 from datetime import datetime
 from uuid import uuid4
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, func
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
@@ -98,6 +109,7 @@ class Attachment(Base, TimestampMixin):
 
 class Task(Base, TimestampMixin):
     __tablename__ = "tasks"
+    __table_args__ = (UniqueConstraint("conversation_id", name="uq_tasks_conversation_id"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
@@ -110,6 +122,7 @@ class Task(Base, TimestampMixin):
     priority: Mapped[str] = mapped_column(String(20), default="normal")
     due_date: Mapped[str | None] = mapped_column(String(80))
     data: Mapped[dict] = mapped_column(JsonType, default=dict)
+    events: Mapped[list["TaskEvent"]] = relationship(order_by="TaskEvent.created_at")
 
 
 class TaskEvent(Base, TimestampMixin):

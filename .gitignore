@@ -22,4 +22,6 @@ test-results/
 *.sqlite3
 *.db
 *.log
+backend/uploads/
+uploads/
 .DS_Store

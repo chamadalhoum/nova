@@ -1,10 +1,16 @@
+import base64
+import binascii
 import hashlib
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from sqlalchemy import and_, func, select, update
-from sqlalchemy.orm import Session
+from sqlalchemy import and_, case, func, or_, select, update
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session, selectinload
 
+from app.ai.memory_context import UserMemoryContextService
 from app.ai.pipeline import NovaAIPipeline
 from app.auth.dependencies import get_current_user, require_admin_user
 from app.capabilities.registry import CapabilityError, capability_registry
@@ -21,6 +27,7 @@ from app.core.security import (
 )
 from app.models import (
     Asset,
+    Attachment,
     AuditLog,
     Conversation,
     Memory,
@@ -39,10 +46,13 @@ from app.models import (
 )
 from app.schemas import (
     AdminDashboardOut,
+    AdminIntelligenceOut,
     AdminPage,
     AIMessageResponse,
     AssetCreate,
     AssetOut,
+    AttachmentCreate,
+    AttachmentOut,
     CapabilityOut,
     ConversationCreate,
     ConversationOut,
@@ -73,8 +83,11 @@ from app.tasks.service import add_task_event, transition_task
 
 router = APIRouter(prefix="/api/v1")
 ai_pipeline = NovaAIPipeline()
+user_memory_context_service = UserMemoryContextService()
 auth_attempts: dict[str, list[datetime]] = {}
 ai_attempts: dict[str, list[datetime]] = {}
+attachment_attempts: dict[str, list[datetime]] = {}
+ALLOWED_ATTACHMENT_TYPES = {"application/pdf", "text/plain"}
 
 PRODUCT_EVENTS = {
     "signup_completed",
@@ -120,6 +133,14 @@ def check_ai_rate_limit(user_id: str) -> None:
         )
 
 
+def check_attachment_rate_limit(user_id: str) -> None:
+    if not check_rate_limit(f"attachment:{user_id}", 20, 60, attachment_attempts):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"message": "Too many attachment uploads. Please wait a moment and try again.", "code": "attachment_rate_limited"},
+        )
+
+
 def token_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
@@ -132,6 +153,7 @@ def user_out(user: User) -> UserOut:
         locale=user.locale,
         timezone=user.timezone,
         role=user.role,
+        created_at=iso(user.created_at),
     )
 
 
@@ -143,6 +165,40 @@ def message_out(message: Message) -> MessageOut:
         content=message.content,
         data=message.data,
         created_at=iso(message.created_at),
+    )
+
+
+def attachment_out(item: Attachment) -> AttachmentOut:
+    return AttachmentOut(
+        id=item.id,
+        message_id=item.message_id,
+        file_name=item.file_name,
+        content_type=item.content_type,
+        size_bytes=int((item.data or {}).get("size_bytes", 0)),
+        created_at=iso(item.created_at),
+    )
+
+
+def is_allowed_attachment(content_type: str | None) -> bool:
+    if not content_type:
+        return False
+    return content_type.startswith("image/") or content_type in ALLOWED_ATTACHMENT_TYPES
+
+
+def max_base64_length(max_bytes: int) -> int:
+    return ((max_bytes + 2) // 3) * 4
+
+
+def user_attachment_storage_bytes(db: Session, user_id: str) -> int:
+    size_bytes = Attachment.data["size_bytes"].as_integer()
+    return int(
+        db.scalar(
+            select(func.coalesce(func.sum(size_bytes), 0))
+            .select_from(Attachment)
+            .join(Message, Message.id == Attachment.message_id)
+            .where(Message.user_id == user_id)
+        )
+        or 0
     )
 
 
@@ -192,10 +248,7 @@ def service_request_out(request: ServiceRequest) -> ServiceRequestOut:
     )
 
 
-def task_out(db: Session, task: Task) -> TaskOut:
-    events = db.scalars(
-        select(TaskEvent).where(TaskEvent.task_id == task.id).order_by(TaskEvent.created_at.asc())
-    ).all()
+def task_out(task: Task) -> TaskOut:
     return TaskOut(
         id=task.id,
         title=task.title,
@@ -208,7 +261,7 @@ def task_out(db: Session, task: Task) -> TaskOut:
         data=task.data,
         created_at=iso(task.created_at),
         updated_at=iso(task.updated_at),
-        events=[event_out(event) for event in events],
+        events=[event_out(event) for event in task.events],
     )
 
 
@@ -278,7 +331,7 @@ def login(payload: UserLogin, request: Request, db: Session = Depends(get_db)) -
     check_auth_rate_limit(f"login-ip:{client_bucket(request)}")
     check_auth_rate_limit(f"login:{payload.email.lower()}")
     user = db.scalar(select(User).where(User.email == payload.email.lower()))
-    if user is None or not verify_password(payload.password, user.password_hash):
+    if user is None or not user.is_active or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     refresh = create_refresh_token(user.id)
     db.add(RefreshToken(user_id=user.id, token_hash=token_hash(refresh)))
@@ -296,6 +349,9 @@ def refresh_token(payload: RefreshRequest, request: Request, db: Session = Depen
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token") from exc
     refresh_hash = token_hash(payload.refresh_token)
+    user = db.get(User, decoded["sub"])
+    if user is None or not user.is_active:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
     result = db.execute(
         update(RefreshToken)
         .where(and_(RefreshToken.token_hash == refresh_hash, RefreshToken.revoked.is_(False)))
@@ -398,6 +454,9 @@ async def send_message(
     ai_context = dict(conversation.context or {})
     ai_context["locale"] = user.locale
     ai_context["timezone"] = user.timezone
+    ai_context["memory_context"] = user_memory_context_service.build_context(
+        db, user, payload.content, ai_context
+    )
     flow = await ai_pipeline.run_async(payload.content, ai_context)
     context = dict(conversation.context or {})
     for key, value in flow.context_update.items():
@@ -426,6 +485,12 @@ async def send_message(
         data=assistant_data,
     )
     db.add(assistant)
+    memory_context = ai_context["memory_context"]
+    memory_categories = {
+        "language_preference": "language",
+        "location_suggestion": "location",
+        "provider_preferences": "provider_proximity",
+    }
     safe_ai_metadata = {
         "provider": flow.metadata.provider,
         "model": flow.metadata.model,
@@ -439,6 +504,14 @@ async def send_message(
         "confidence": flow.intent.confidence,
         "missing_fields": flow.intent.missing_fields,
         "token_usage": flow.metadata.token_usage,
+        "prompt_version": flow.metadata.prompt_version,
+        "fallback_from_provider": flow.metadata.fallback_from_provider,
+        "total_latency_ms": flow.metadata.total_latency_ms,
+        "memory_context_used": bool(memory_context),
+        "memory_context_count": len(memory_context),
+        "memory_context_categories": [
+            category for key, category in memory_categories.items() if key in memory_context
+        ],
     }
     db.add(AuditLog(user_id=user.id, action="ai.intent_processed", data=safe_ai_metadata))
     track_product_event(
@@ -481,13 +554,116 @@ async def send_message(
     )
 
 
+@router.post("/messages/{message_id}/attachments", response_model=AttachmentOut, status_code=status.HTTP_201_CREATED)
+def upload_message_attachment(
+    message_id: str,
+    payload: AttachmentCreate,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AttachmentOut:
+    check_attachment_rate_limit(user.id)
+    message = db.scalar(
+        select(Message)
+        .join(Conversation, Conversation.id == Message.conversation_id)
+        .where(and_(Message.id == message_id, Message.user_id == user.id, Conversation.user_id == user.id))
+    )
+    if message is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
+    # PostgreSQL serializes concurrent uploads for this user so quota checks stay enforceable.
+    db.execute(select(User.id).where(User.id == user.id).with_for_update()).scalar_one()
+    if not is_allowed_attachment(payload.content_type):
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail={"message": "This file type is not supported.", "code": "attachment_type_not_allowed"},
+        )
+    attachment_count = db.scalar(select(func.count()).select_from(Attachment).where(Attachment.message_id == message.id)) or 0
+    if attachment_count >= settings.attachment_max_per_message:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"message": "This message already has the maximum number of attachments.", "code": "attachment_limit_reached"},
+        )
+    if len(payload.content_base64) > max_base64_length(settings.attachment_max_bytes):
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail={"message": "This file is too large.", "code": "attachment_too_large"},
+        )
+    try:
+        content = base64.b64decode(payload.content_base64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"message": "Attachment content is invalid.", "code": "attachment_invalid_content"},
+        ) from exc
+    if len(content) > settings.attachment_max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail={"message": "This file is too large.", "code": "attachment_too_large"},
+        )
+    if user_attachment_storage_bytes(db, user.id) + len(content) > settings.attachment_user_storage_quota_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail={"message": "Attachment storage quota reached.", "code": "attachment_quota_exceeded"},
+        )
+    attachment_id = str(uuid4())
+    extension_by_type = {"application/pdf": ".pdf", "text/plain": ".txt"}
+    extension = extension_by_type.get(payload.content_type, ".bin")
+    if payload.content_type.startswith("image/"):
+        subtype = payload.content_type.split("/", 1)[1].split("+", 1)[0]
+        extension = f".{subtype[:12]}"
+    attachment_dir = Path(settings.attachment_storage_dir)
+    attachment_dir.mkdir(parents=True, exist_ok=True)
+    server_name = f"{attachment_id}{extension}"
+    attachment_path = attachment_dir / server_name
+    temporary_path = attachment_dir / f".{attachment_id}.upload"
+    try:
+        temporary_path.write_bytes(content)
+        temporary_path.replace(attachment_path)
+    except OSError as exc:
+        temporary_path.unlink(missing_ok=True)
+        attachment_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"message": "Attachment storage failed.", "code": "attachment_storage_failed"},
+        ) from exc
+    display_name = Path(payload.file_name).name[:120] or "attachment"
+    item = Attachment(
+        id=attachment_id,
+        message_id=message.id,
+        file_name=display_name,
+        content_type=payload.content_type,
+        url=f"nova-attachment:{attachment_id}",
+        data={"size_bytes": len(content), "stored_name": server_name},
+    )
+    db.add(item)
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        attachment_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"message": "Attachment could not be saved.", "code": "attachment_persistence_failed"},
+        ) from exc
+    db.refresh(item)
+    return attachment_out(item)
+
+
 @router.post("/conversations/{conversation_id}/confirm-task", response_model=TaskOut)
 def confirm_conversation_task(
     conversation_id: str,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> TaskOut:
-    conversation = get_owned_conversation(db, user, conversation_id)
+    conversation = db.scalar(
+        select(Conversation)
+        .where(and_(Conversation.id == conversation_id, Conversation.user_id == user.id))
+        .with_for_update()
+    )
+    if conversation is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+    existing_task = db.scalar(select(Task).where(Task.conversation_id == conversation.id))
+    if existing_task is not None:
+        return task_out(existing_task)
     pending_task = (conversation.context or {}).get("pending_task")
     if not pending_task:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No task is waiting for confirmation")
@@ -554,7 +730,7 @@ def confirm_conversation_task(
     conversation.context = context
     db.commit()
     db.refresh(task)
-    return task_out(db, task)
+    return task_out(task)
 
 
 @router.post("/tasks/{task_id}/start", response_model=TaskOut)
@@ -563,11 +739,11 @@ def start_task(
 ) -> TaskOut:
     task = get_owned_task(db, user, task_id)
     if task.status == "IN_PROGRESS":
-        return task_out(db, task)
+        return task_out(task)
     transition_task(db, task, "IN_PROGRESS", "started", "Task started.")
     db.commit()
     db.refresh(task)
-    return task_out(db, task)
+    return task_out(task)
 
 
 @router.post("/tasks", response_model=TaskOut, status_code=status.HTTP_201_CREATED)
@@ -582,18 +758,23 @@ def create_task(
     add_task_event(db, task, "created", "Task created manually.")
     db.commit()
     db.refresh(task)
-    return task_out(db, task)
+    return task_out(task)
 
 
 @router.get("/tasks", response_model=list[TaskOut])
 def list_tasks(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[TaskOut]:
-    tasks = db.scalars(select(Task).where(Task.user_id == user.id).order_by(Task.created_at.desc())).all()
-    return [task_out(db, task) for task in tasks]
+    tasks = db.scalars(
+        select(Task)
+        .options(selectinload(Task.events))
+        .where(Task.user_id == user.id)
+        .order_by(Task.created_at.desc())
+    ).all()
+    return [task_out(task) for task in tasks]
 
 
 @router.get("/tasks/{task_id}", response_model=TaskOut)
 def get_task(task_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> TaskOut:
-    return task_out(db, get_owned_task(db, user, task_id))
+    return task_out(get_owned_task(db, user, task_id))
 
 
 @router.patch("/tasks/{task_id}", response_model=TaskOut)
@@ -604,12 +785,21 @@ def update_task(
     db: Session = Depends(get_db),
 ) -> TaskOut:
     task = get_owned_task(db, user, task_id)
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    updates = payload.model_dump(exclude={"data"}, exclude_unset=True)
+    for field, value in updates.items():
         setattr(task, field, value)
+    if payload.data is not None:
+        task_data = dict(task.data or {})
+        for key, value in payload.data.model_dump(exclude_unset=True).items():
+            if value is None:
+                task_data.pop(key, None)
+            else:
+                task_data[key] = value
+        task.data = task_data
     add_task_event(db, task, "updated", "Task details updated.")
     db.commit()
     db.refresh(task)
-    return task_out(db, task)
+    return task_out(task)
 
 
 @router.post("/tasks/{task_id}/complete", response_model=TaskOut)
@@ -618,12 +808,12 @@ def complete_task(
 ) -> TaskOut:
     task = get_owned_task(db, user, task_id)
     if task.status == "COMPLETED":
-        return task_out(db, task)
+        return task_out(task)
     transition_task(db, task, "COMPLETED", "completed", "Task marked as completed.")
     track_product_event(db, user.id, "task_completed", {"task_id": task.id})
     db.commit()
     db.refresh(task)
-    return task_out(db, task)
+    return task_out(task)
 
 
 @router.post("/tasks/{task_id}/cancel", response_model=TaskOut)
@@ -632,11 +822,11 @@ def cancel_task(
 ) -> TaskOut:
     task = get_owned_task(db, user, task_id)
     if task.status == "CANCELLED":
-        return task_out(db, task)
+        return task_out(task)
     transition_task(db, task, "CANCELLED", "cancelled", "Task cancelled.")
     db.commit()
     db.refresh(task)
-    return task_out(db, task)
+    return task_out(task)
 
 
 @router.post("/memories", response_model=MemoryOut, status_code=status.HTTP_201_CREATED)
@@ -920,7 +1110,7 @@ def select_provider_for_task(
             and existing_request.provider_id == provider.id
             and existing_request.status in {"PREPARED", "CONFIRMED"}
         ):
-            return task_out(db, task)
+            return task_out(task)
     request = ServiceRequest(
         user_id=user.id,
         task_id=task.id,
@@ -985,7 +1175,7 @@ def select_provider_for_task(
     track_product_event(db, user.id, "service_request_prepared", {"task_id": task.id, "service_request_id": request.id})
     db.commit()
     db.refresh(task)
-    return task_out(db, task)
+    return task_out(task)
 
 
 @router.post("/service-requests", status_code=status.HTTP_201_CREATED)
@@ -1014,7 +1204,7 @@ def create_service_request(
     if payload.task_id:
         current_request = (task.data or {}).get("service_request") or {}
         current_request_id = current_request.get("id")
-        if current_request_id:
+        if current_request_id and not payload.note:
             existing_request = db.get(ServiceRequest, current_request_id)
             if (
                 existing_request is not None
@@ -1088,6 +1278,18 @@ def create_service_request(
         "message": "Service request prepared. No external provider was contacted or booked.",
         "data": request.data,
     }
+
+
+@router.get("/service-requests", response_model=list[ServiceRequestOut])
+def list_service_requests(
+    user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> list[ServiceRequestOut]:
+    items = db.scalars(
+        select(ServiceRequest)
+        .where(ServiceRequest.user_id == user.id)
+        .order_by(ServiceRequest.updated_at.desc())
+    ).all()
+    return [service_request_out(item) for item in items]
 
 
 def get_owned_service_request(db: Session, user: User, service_request_id: str) -> ServiceRequest:
@@ -1211,6 +1413,9 @@ SAFE_AUDIT_KEYS = {
     "confidence",
     "missing_fields",
     "token_usage",
+    "prompt_version",
+    "fallback_from_provider",
+    "total_latency_ms",
     "conversation_id",
     "task_id",
     "service_request_id",
@@ -1231,10 +1436,17 @@ def safe_audit_data(data: dict) -> dict:
 def page_from_query(db: Session, query, count_query, limit: int, offset: int, serializer) -> AdminPage:
     total = db.scalar(count_query) or 0
     items = db.scalars(query.limit(limit).offset(offset)).all()
-    return AdminPage(items=[serializer(item) for item in items], limit=limit, offset=offset, total=total)
+    return AdminPage(
+        items=[serializer(item) for item in items],
+        limit=limit,
+        offset=offset,
+        total=total,
+        page=(offset // limit) + 1,
+        page_count=(total + limit - 1) // limit,
+    )
 
 
-def admin_user_item(user: User) -> dict:
+def admin_user_item(user: User, last_login_at: datetime | None = None) -> dict:
     return {
         "id": user.id,
         "email": user.email,
@@ -1245,6 +1457,7 @@ def admin_user_item(user: User) -> dict:
         "is_active": user.is_active,
         "created_at": iso(user.created_at),
         "updated_at": iso(user.updated_at),
+        "last_login_at": iso(last_login_at),
     }
 
 
@@ -1262,6 +1475,16 @@ def admin_task_item(task: Task) -> dict:
         "created_at": iso(task.created_at),
         "updated_at": iso(task.updated_at),
     }
+
+
+def admin_task_detail_item(db: Session, task: Task) -> dict:
+    item = admin_task_item(task)
+    item["description"] = task.description
+    item["events"] = [
+        {"event_type": event.event_type, "message": event.message, "created_at": iso(event.created_at)}
+        for event in db.scalars(select(TaskEvent).where(TaskEvent.task_id == task.id).order_by(TaskEvent.created_at.asc())).all()
+    ]
+    return item
 
 
 def admin_service_request_item(item: ServiceRequest) -> dict:
@@ -1336,10 +1559,63 @@ def admin_dashboard(
     )
 
 
+@router.get("/admin/intelligence", response_model=AdminIntelligenceOut)
+def admin_intelligence(
+    days: int = Query(default=7, ge=1, le=90),
+    admin: User = Depends(require_admin_user),
+    db: Session = Depends(get_db),
+) -> AdminIntelligenceOut:
+    del admin
+    cutoff = datetime.now(UTC) - timedelta(days=days - 1)
+    filters = (AuditLog.action == "ai.intent_processed", AuditLog.created_at >= cutoff)
+    success = AuditLog.data["success"].as_boolean()
+    fallback = AuditLog.data["fallback_used"].as_boolean()
+    latency = AuditLog.data["latency_ms"].as_float()
+    success_total = func.sum(case((success.is_(True), 1), else_=0))
+    fallback_total = func.sum(case((fallback.is_(True), 1), else_=0))
+    total, successes, fallbacks, average_latency = db.execute(
+        select(func.count(), success_total, fallback_total, func.avg(latency)).where(*filters)
+    ).one()
+    total = int(total or 0)
+    successes = int(successes or 0)
+    fallbacks = int(fallbacks or 0)
+    day = func.date(AuditLog.created_at).label("date")
+    trend_rows = db.execute(
+        select(day, func.count(), success_total, fallback_total, func.avg(latency))
+        .where(*filters)
+        .group_by(day)
+        .order_by(day)
+    ).all()
+    trends = [
+        {
+            "date": str(row.date),
+            "total": int(row[1]),
+            "success_rate": (int(row[2] or 0) / int(row[1])) * 100 if row[1] else None,
+            "fallback_rate": (int(row[3] or 0) / int(row[1])) * 100 if row[1] else None,
+            "average_latency_ms": float(row[4]) if row[4] is not None else None,
+        }
+        for row in trend_rows
+    ]
+    intent = AuditLog.data["intent"].as_string().label("intent")
+    intentions = db.execute(
+        select(intent, func.count())
+        .where(*filters, intent.is_not(None), intent != "")
+        .group_by(intent)
+        .order_by(intent)
+    ).all()
+    return AdminIntelligenceOut(
+        period_days=days,
+        ai={"total": total, "success_rate": (successes / total) * 100 if total else None, "failure_rate": ((total - successes) / total) * 100 if total else None, "fallback_rate": (fallbacks / total) * 100 if total else None, "average_latency_ms": float(average_latency) if average_latency is not None else None},
+        trends=trends,
+        intentions=[{"intent": row.intent, "total": int(row[1])} for row in intentions],
+    )
+
+
 @router.get("/admin/users", response_model=AdminPage)
 def admin_users(
     pagination: tuple[int, int] = Depends(admin_page),
     role: str | None = Query(default=None, max_length=32),
+    q: str | None = Query(default=None, max_length=160),
     admin: User = Depends(require_admin_user),
     db: Session = Depends(get_db),
 ) -> AdminPage:
@@ -1349,6 +1625,16 @@ def admin_users(
     if role:
         query = query.where(User.role == role)
         count_query = count_query.where(User.role == role)
+    normalized_query = (q or "").strip().lower()
+    if normalized_query:
+        escaped_query = normalized_query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped_query}%"
+        search_filter = or_(
+            func.lower(User.email).like(pattern, escape="\\"),
+            func.lower(func.coalesce(User.full_name, "")).like(pattern, escape="\\"),
+        )
+        query = query.where(search_filter)
+        count_query = count_query.where(search_filter)
     return page_from_query(db, query, count_query, limit, offset, admin_user_item)
 
 
@@ -1361,7 +1647,13 @@ def admin_user_detail(
     item = db.get(User, user_id)
     if item is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-    return admin_user_item(item)
+    last_login_at = db.scalar(
+        select(func.max(AuditLog.created_at)).where(
+            AuditLog.user_id == item.id,
+            AuditLog.action == "auth.login",
+        )
+    )
+    return admin_user_item(item, last_login_at)
 
 
 @router.get("/admin/tasks", response_model=AdminPage)
@@ -1384,6 +1676,19 @@ def admin_tasks(
     return page_from_query(db, query, count_query, limit, offset, admin_task_item)
 
 
+@router.get("/admin/tasks/{task_id}")
+def admin_task_detail(
+    task_id: str,
+    admin: User = Depends(require_admin_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    del admin
+    item = db.get(Task, task_id)
+    if item is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+    return admin_task_detail_item(db, item)
+
+
 @router.get("/admin/service-requests", response_model=AdminPage)
 def admin_service_requests(
     pagination: tuple[int, int] = Depends(admin_page),
@@ -1402,6 +1707,19 @@ def admin_service_requests(
         query = query.where(ServiceRequest.user_id == user_id)
         count_query = count_query.where(ServiceRequest.user_id == user_id)
     return page_from_query(db, query, count_query, limit, offset, admin_service_request_item)
+
+
+@router.get("/admin/service-requests/{service_request_id}")
+def admin_service_request_detail(
+    service_request_id: str,
+    admin: User = Depends(require_admin_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    del admin
+    item = db.get(ServiceRequest, service_request_id)
+    if item is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Service request not found")
+    return admin_service_request_item(item)
 
 
 @router.get("/admin/providers", response_model=AdminPage)
@@ -1425,6 +1743,9 @@ def admin_audit_logs(
     pagination: tuple[int, int] = Depends(admin_page),
     action: str | None = Query(default=None, max_length=120),
     user_id: str | None = Query(default=None, max_length=36),
+    q: str | None = Query(default=None, max_length=120),
+    start_at: datetime | None = Query(default=None),
+    end_at: datetime | None = Query(default=None),
     admin: User = Depends(require_admin_user),
     db: Session = Depends(get_db),
 ) -> AdminPage:
@@ -1437,6 +1758,16 @@ def admin_audit_logs(
     if user_id:
         query = query.where(AuditLog.user_id == user_id)
         count_query = count_query.where(AuditLog.user_id == user_id)
+    if q and q.strip():
+        pattern = f"%{q.strip().lower()}%"
+        query = query.where(func.lower(AuditLog.action).like(pattern))
+        count_query = count_query.where(func.lower(AuditLog.action).like(pattern))
+    if start_at:
+        query = query.where(AuditLog.created_at >= start_at)
+        count_query = count_query.where(AuditLog.created_at >= start_at)
+    if end_at:
+        query = query.where(AuditLog.created_at <= end_at)
+        count_query = count_query.where(AuditLog.created_at <= end_at)
     return page_from_query(db, query, count_query, limit, offset, admin_audit_item)
 
 
@@ -1459,12 +1790,36 @@ def admin_analytics(
 @router.get("/admin/ai-events", response_model=AdminPage)
 def admin_ai_events(
     pagination: tuple[int, int] = Depends(admin_page),
+    provider: str | None = Query(default=None, max_length=120),
+    model: str | None = Query(default=None, max_length=120),
+    intent: str | None = Query(default=None, max_length=120),
+    success: bool | None = Query(default=None),
+    fallback: bool | None = Query(default=None),
+    start_at: datetime | None = Query(default=None),
+    end_at: datetime | None = Query(default=None),
     admin: User = Depends(require_admin_user),
     db: Session = Depends(get_db),
 ) -> AdminPage:
     limit, offset = pagination
     query = select(AuditLog).where(AuditLog.action.like("ai.%")).order_by(AuditLog.created_at.desc(), AuditLog.id.asc())
     count_query = select(func.count()).select_from(AuditLog).where(AuditLog.action.like("ai.%"))
+    for key, value in (("provider", provider), ("model", model), ("intent", intent)):
+        if value:
+            clause = AuditLog.data[key].as_string() == value
+            query = query.where(clause)
+            count_query = count_query.where(clause)
+    if success is not None:
+        query = query.where(AuditLog.data["success"].as_boolean().is_(success))
+        count_query = count_query.where(AuditLog.data["success"].as_boolean().is_(success))
+    if fallback is not None:
+        query = query.where(AuditLog.data["fallback_used"].as_boolean().is_(fallback))
+        count_query = count_query.where(AuditLog.data["fallback_used"].as_boolean().is_(fallback))
+    if start_at:
+        query = query.where(AuditLog.created_at >= start_at)
+        count_query = count_query.where(AuditLog.created_at >= start_at)
+    if end_at:
+        query = query.where(AuditLog.created_at <= end_at)
+        count_query = count_query.where(AuditLog.created_at <= end_at)
     return page_from_query(db, query, count_query, limit, offset, admin_audit_item)
 
 

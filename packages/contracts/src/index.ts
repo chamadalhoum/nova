@@ -191,6 +191,7 @@ export interface NovaUser {
   locale: string;
   timezone: string;
   role: "user" | "admin" | string;
+  created_at: string;
 }
 
 export interface NovaConversation {
@@ -210,6 +211,21 @@ export interface NovaMessage {
   content: string;
   data: Record<string, unknown>;
   created_at: string;
+}
+
+export interface NovaAttachment {
+  id: string;
+  message_id: string;
+  file_name: string;
+  content_type: string;
+  size_bytes: number;
+  created_at: string;
+}
+
+export interface NovaAttachmentCreate {
+  file_name: string;
+  content_type: string;
+  content_base64: string;
 }
 
 export interface NovaAIMessageResponse {
@@ -263,6 +279,8 @@ export interface NovaAdminPage<T> {
   limit: number;
   offset: number;
   total: number;
+  page: number;
+  page_count: number;
 }
 
 export interface NovaAdminDashboard {
@@ -290,6 +308,7 @@ export interface NovaAdminUser {
   is_active: boolean;
   created_at: string;
   updated_at: string;
+  last_login_at: string | null;
 }
 
 export interface NovaAdminTask {
@@ -304,6 +323,8 @@ export interface NovaAdminTask {
   due_date: string | null;
   created_at: string;
   updated_at: string;
+  description?: string;
+  events?: Array<{ event_type: string; message: string; created_at: string }>;
 }
 
 export interface NovaAdminServiceRequest {

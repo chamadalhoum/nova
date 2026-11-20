@@ -1,9 +1,14 @@
 import re
+import time
 from datetime import UTC, date, datetime, timedelta
 
-from app.ai.provider import AIProviderError, DeterministicProvider, get_provider_for_mode
+from app.ai.provider import (
+    INTENT_PROMPT_VERSION,
+    AIProviderError,
+    DeterministicProvider,
+    get_provider_for_mode,
+)
 from app.ai.schemas import AIExecutionMetadata, AIFlowResult, IntentResult, TaskPlan
-from app.core.config import settings
 
 LOCATION_HINTS = {
     "ariana",
@@ -33,7 +38,7 @@ NEXT_ACTION_BY_INTENT = {
 SERVICE_KEYWORDS = {
     "air_conditioning": ["clim", "ac", "air conditioning", "الكليم", "كليم", "climatiseur", "climatisation"],
     "plumbing": ["leak", "fuite", "water", "plomberie", "plumbing", "plombier", "plumber", "ماء", "سباك"],
-    "electricity": ["electric", "électricité", "electricien", "électricien", "dhaw", "ضو"],
+    "electricity": ["electric", "électricité", "electricien", "électricien", "dhaw", "ضو", "كهربائي"],
     "appliance_repair": ["machine", "fridge", "refrigerator", "réfrigérateur", "غسالة"],
     "car_repair": ["car", "vehicle", "voiture", "auto", "mécanicien", "mechanic"],
     "painting": ["paint", "painting", "peinture", "صباغة"],
@@ -138,15 +143,19 @@ class IntentClassifier:
         has_arabic = bool(re.search(r"[\u0600-\u06FF]", text))
         has_latin = bool(re.search(r"[A-Za-z]", text))
         has_arabizi = any(token in lowered for token in ["n7eb", "ysala7", "ghodwa", "findli", "wa7ed", "fama"])
-        has_french = any(token in lowered for token in ["répare", "réparer", "demain", "fuite", "je veux", "cherche"])
+        has_french = any(token in lowered for token in ["répare", "réparer", "réparateur", "demain", "fuite", "je veux", "cherche"])
+        has_standard_arabic = any(token in text for token in ["أريد", "أبحث", "العثور", "أحتاج", "من فضلك"])
+        has_tunisian_arabic = any(token in text for token in ["نحب", "شنوة", "غدوة", "فما", "نلقى", "الكوجينة"])
         if has_arabic and has_latin:
             return "mixed"
         if has_arabizi and has_french:
             return "mixed"
         if has_arabizi or "n7جز" in text:
             return "arabizi"
+        if has_standard_arabic:
+            return "ar"
         if has_arabic:
-            return "tn"
+            return "tn" if has_tunisian_arabic else "ar"
         if has_french:
             return "fr"
         return "en"
@@ -207,6 +216,9 @@ class IntentClassifier:
             "organiser",
             "نظم",
             "ننظم",
+            "أريد",
+            "أبحث",
+            "العثور",
         ]
         has_action = any(term in normalized for term in action_terms)
         for category, terms in SERVICE_KEYWORDS.items():
@@ -238,7 +250,7 @@ class IntentClassifier:
 class ContextManager:
     def build(self, context: dict | None) -> dict:
         existing = context or {}
-        return {
+        built = {
             "locale": existing.get("locale", "en"),
             "timezone": existing.get("timezone", "UTC"),
             "pending_intent": existing.get("pending_intent"),
@@ -252,6 +264,9 @@ class ContextManager:
             "last_question": existing.get("last_question"),
             "conversation_language": existing.get("conversation_language", existing.get("locale", "en")),
         }
+        if existing.get("memory_context"):
+            built["memory_context"] = existing["memory_context"]
+        return built
 
 
 class ConfidenceManager:
@@ -264,11 +279,23 @@ class ConfidenceManager:
 class QuestionManager:
     def question_for(self, intent: IntentResult) -> str:
         if "location" in intent.missing_fields:
-            if intent.language in {"arabizi", "ar", "mixed"}:
-                return "Nfhem elli t7eb service. Fi anéhi ville/zone, which city or area, nlawwej?"
-            return "I understand what service you need. Which city or area should I search in?"
+            location_questions = {
+                "fr": "J'ai compris le service recherché. Dans quelle ville ou zone dois-je chercher ?",
+                "ar": "فهمت الخدمة التي تبحث عنها. في أي مدينة أو منطقة تريدني أن أبحث؟",
+                "tn": "فهمت الخدمة اللي تحب عليها. في أنهي مدينة أو منطقة نلوّج؟",
+                "arabizi": "Nfhem el service elli t7eb عليه. Fi anéhi ville ou zone nlawwej?",
+                "mixed": "Nfhem el service elli t7eb عليه. Dans quelle ville ou zone nlawwej ?",
+            }
+            return location_questions.get(intent.language, "I understand what service you need. Which city or area should I search in?")
         if "appointment_subject" in intent.missing_fields:
-            return "What kind of appointment do you want NOVA to help you prepare?"
+            appointment_questions = {
+                "fr": "Quel type de rendez-vous souhaitez-vous que NOVA vous aide à préparer ?",
+                "ar": "ما نوع الموعد الذي تريد أن تساعدك NOVA في تحضيره؟",
+                "tn": "شنوة نوع الموعد اللي تحب NOVA تعاونك تحضّرو؟",
+                "arabizi": "Chnowa no3 el rendez-vous elli t7eb NOVA te3awnek t7adhrou?",
+                "mixed": "Chnowa no3 el rendez-vous que NOVA peut t'aider à préparer ?",
+            }
+            return appointment_questions.get(intent.language, "What kind of appointment do you want NOVA to help you prepare?")
         return "I could not understand enough yet. Could you describe what you need NOVA to help with?"
 
 
@@ -396,32 +423,50 @@ class NovaAIPipeline:
         self.fallback_provider = fallback_provider or DeterministicProvider()
 
     def run(self, text: str, context: dict | None = None) -> AIFlowResult:
-        return self._run_with_intent(text, context, self.intent_classifier.classify(text, context or {}), AIExecutionMetadata())
+        started = time.perf_counter()
+        result = self._run_with_intent(
+            text,
+            context,
+            self.intent_classifier.classify(text, context or {}),
+            AIExecutionMetadata(prompt_version=INTENT_PROMPT_VERSION),
+        )
+        result.metadata = result.metadata.model_copy(
+            update={"total_latency_ms": int((time.perf_counter() - started) * 1000)}
+        )
+        return result
 
     async def run_async(self, text: str, context: dict | None = None) -> AIFlowResult:
+        started = time.perf_counter()
         existing = self.context_manager.build(context)
         if existing.get("pending_intent"):
-            return self.run(text, existing)
+            result = self.run(text, existing)
+            result.metadata = result.metadata.model_copy(
+                update={"total_latency_ms": int((time.perf_counter() - started) * 1000)}
+            )
+            return result
 
         provider = self.provider
-        mode = settings.ai_mode.lower()
-        metadata = AIExecutionMetadata()
+        metadata = AIExecutionMetadata(prompt_version=INTENT_PROMPT_VERSION)
         try:
             if provider is None:
                 provider = get_provider_for_mode()
             intent, metadata = await provider.classify(text, existing)
         except AIProviderError as exc:
-            if mode == "real":
-                intent, metadata = await self.fallback_provider.classify(text, existing)
-                metadata = metadata.model_copy(
-                    update={"fallback_used": True, "success": False, "error_type": exc.__class__.__name__}
-                )
-            else:
-                intent, metadata = await self.fallback_provider.classify(text, existing)
-                metadata = metadata.model_copy(
-                    update={"fallback_used": True, "success": False, "error_type": exc.__class__.__name__}
-                )
-        return self._run_with_intent(text, existing, intent, metadata)
+            fallback_from_provider = type(provider).__name__.lower() if provider is not None else "configured_provider"
+            intent, metadata = await self.fallback_provider.classify(text, existing)
+            metadata = metadata.model_copy(
+                update={
+                    "fallback_used": True,
+                    "success": False,
+                    "error_type": exc.__class__.__name__,
+                    "fallback_from_provider": fallback_from_provider,
+                }
+            )
+        result = self._run_with_intent(text, existing, intent, metadata)
+        result.metadata = result.metadata.model_copy(
+            update={"total_latency_ms": int((time.perf_counter() - started) * 1000)}
+        )
+        return result
 
     def _run_with_intent(
         self,
@@ -431,6 +476,7 @@ class NovaAIPipeline:
         metadata: AIExecutionMetadata,
     ) -> AIFlowResult:
         existing = self.context_manager.build(context)
+        intent = self._guard_memory_location_provenance(text, existing, intent)
         pending = existing.get("pending_intent")
         pending_task = existing.get("pending_task")
         if pending and pending.get("missing_fields") and not self._is_intent_reset(text, intent, pending):
@@ -480,6 +526,36 @@ class NovaAIPipeline:
             },
             metadata=metadata,
         )
+
+    def _guard_memory_location_provenance(
+        self, text: str, existing: dict, intent: IntentResult
+    ) -> IntentResult:
+        """Keep saved location suggestions from becoming confirmed entities."""
+        memory_context = existing.get("memory_context") or {}
+        suggestion = memory_context.get("location_suggestion") if isinstance(memory_context, dict) else None
+        if not isinstance(suggestion, str) or not suggestion:
+            return intent
+
+        data = intent.model_dump()
+        entities = dict(data["entities"])
+        current_location = self.intent_classifier._extract_location(text.lower())
+        known_entities = existing.get("known_entities") or {}
+        confirmed_location = known_entities.get("location") if isinstance(known_entities, dict) else None
+        provider_location = entities.get("location")
+
+        if current_location:
+            entities["location"] = current_location
+            data["missing_fields"] = [field for field in data["missing_fields"] if field != "location"]
+        elif (
+            isinstance(provider_location, str)
+            and provider_location.casefold() == suggestion.casefold()
+            and (not isinstance(confirmed_location, str) or confirmed_location.casefold() != provider_location.casefold())
+        ):
+            entities.pop("location", None)
+            data["missing_fields"] = sorted(set(data["missing_fields"] + ["location"]))
+
+        data["entities"] = entities
+        return IntentResult.model_validate(data)
 
     def _is_intent_reset(self, text: str, incoming: IntentResult, previous: dict) -> bool:
         normalized = text.lower()

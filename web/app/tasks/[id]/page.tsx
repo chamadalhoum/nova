@@ -4,20 +4,7 @@ import { useParams } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
 import { apiFetch, getAccessToken, ServiceDiscoveryResponse, ServiceRequest, Task } from "@/lib/api";
-
-function statusLabel(status: string) {
-  const labels: Record<string, string> = {
-    DRAFT: "NOVA is preparing this task",
-    NEEDS_INFO: "NOVA needs one detail from you",
-    PLANNED: "NOVA has a plan",
-    WAITING_CONFIRMATION: "Review and confirm before NOVA continues",
-    CONFIRMED: "Confirmed",
-    IN_PROGRESS: "In progress",
-    COMPLETED: "Done",
-    CANCELLED: "Cancelled",
-  };
-  return labels[status] || status.replaceAll("_", " ");
-}
+import { Button, Card, EmptyState, ErrorState, LoadingState, StatusBadge, Timeline, statusLabel } from "@/components/ui";
 
 function nextStep(task: Task) {
   const terminalSteps: Record<string, string> = {
@@ -40,10 +27,6 @@ function nextStep(task: Task) {
 
 function formatValue(value: unknown) {
   return typeof value === "string" && value.trim() ? value : "Not provided";
-}
-
-function eventLabel(eventType: string) {
-  return eventType.replaceAll("_", " ").replace(/^\w/, (letter) => letter.toUpperCase());
 }
 
 export default function TaskDetailPage() {
@@ -70,21 +53,22 @@ export default function TaskDetailPage() {
     mutationFn: (serviceRequestId: string) => apiFetch<ServiceRequest>(`/api/v1/service-requests/${serviceRequestId}/confirm`, { method: "POST" }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["task", params.id] }),
   });
-  if (!hasToken || error) return <p className="rounded-2xl bg-red-50 p-4 text-red-800">Task not found or login required.</p>;
-  if (!task) return <p>Preparing task details...</p>;
+  if (!hasToken || error) return <ErrorState title="Task not found or login required." message={error instanceof Error ? error.message : undefined} />;
+  if (!task) return <LoadingState label="Preparing task details..." />;
   const selectedProvider = task.data?.selected_provider as { id?: string; name?: string; location?: string; is_demo?: boolean } | undefined;
   const serviceRequest = task.data?.service_request as { id?: string; status?: string; risk_level?: string } | undefined;
   const entities = task.data?.entities ?? {};
   const showServiceDiscovery = task.data?.next_capability === "search_services" || Boolean(serviceSearch.data);
   return (
-    <section className="rounded-[2rem] bg-white p-6 shadow-soft">
-      <span className="rounded-full bg-mist px-3 py-1 text-sm">{statusLabel(task.status)}</span>
-      <h1 className="mt-4 text-3xl font-semibold">{task.title}</h1>
-      <p className="mt-3 text-gray-600">{task.description}</p>
+    <section className="grid gap-5">
+      <Card>
+      <StatusBadge status={task.status} />
+      <h1 className="mt-4 text-3xl font-semibold tracking-tight sm:text-4xl">{task.title}</h1>
+      <p className="mt-3 max-w-3xl text-gray-600">{task.description}</p>
       <div className="mt-5 grid gap-3 rounded-3xl bg-mist p-4 sm:grid-cols-3">
         <p><span className="block text-xs uppercase tracking-wide text-gray-500">Status</span>{statusLabel(task.status)}</p>
-        <p><span className="block text-xs uppercase tracking-wide text-gray-500">Date</span>{task.due_date || "Not set"}</p>
-        <p><span className="block text-xs uppercase tracking-wide text-gray-500">Area</span>{entities.location || "Not set"}</p>
+        {task.due_date && <p><span className="block text-xs uppercase tracking-wide text-gray-500">Date</span>{task.due_date}</p>}
+        {entities.location && <p><span className="block text-xs uppercase tracking-wide text-gray-500">Area</span>{entities.location}</p>}
       </div>
       <div className="mt-4 rounded-3xl border border-calm/20 p-4">
         <p className="text-sm font-medium uppercase tracking-wide text-calm">Next</p>
@@ -115,7 +99,7 @@ export default function TaskDetailPage() {
             <div className="mt-4 rounded-2xl bg-mist p-4">
               <p className="font-medium">Before you continue</p>
               <p className="mt-2 text-sm text-gray-700">This confirms your internal NOVA request only. This is a demo provider and no real booking will be made.</p>
-              <button onClick={() => confirmRequest.mutate(serviceRequest.id!)} className="mt-3 min-h-11 rounded-full bg-ink px-5 text-white" disabled={confirmRequest.isPending}>{confirmRequest.isPending ? "Confirming request..." : "Confirm request"}</button>
+              <Button className="mt-3" onClick={() => confirmRequest.mutate(serviceRequest.id!)} disabled={confirmRequest.isPending}>{confirmRequest.isPending ? "Confirming request..." : "Confirm request"}</Button>
             </div>
           )}
           {serviceRequest.status === "CONFIRMED" && <p className="mt-3 rounded-2xl bg-green-50 p-3 text-sm text-green-800">Your NOVA task is updated. Next step: real provider booking is not connected yet.</p>}
@@ -125,7 +109,7 @@ export default function TaskDetailPage() {
         <div className="mt-4 rounded-3xl bg-amber-50 p-4 text-amber-950">
           <p className="font-medium">Service discovery foundation</p>
           <p className="mt-1 text-sm">Search demo options from the NOVA provider directory. Availability, ratings, prices and booking are not connected.</p>
-          <button onClick={() => serviceSearch.mutate()} className="mt-3 min-h-11 rounded-full bg-ink px-5 text-white" disabled={serviceSearch.isPending}>{serviceSearch.isPending ? "Searching options..." : "Search options"}</button>
+          <Button className="mt-3" onClick={() => serviceSearch.mutate()} disabled={serviceSearch.isPending}>{serviceSearch.isPending ? "Searching options..." : "Search options"}</Button>
           {serviceSearch.data && <p className="mt-3 text-sm">{serviceSearch.data.message}</p>}
           {serviceSearch.data?.results.length === 0 && <p className="mt-3 rounded-2xl bg-white/70 p-3 text-sm">No demo providers found for this service and location. Your task is still saved.</p>}
           <div className="mt-4 grid gap-4 md:grid-cols-2">
@@ -143,7 +127,7 @@ export default function TaskDetailPage() {
                 <p className="mt-3 text-xs text-gray-500">Demo information. Not real-time availability.</p>
                 <div className="mt-4 flex flex-wrap gap-2">
                   <Link className="min-h-11 rounded-full border px-4 py-3 text-sm" href={`/providers/${provider.id}`}>View details</Link>
-                  <button onClick={() => selectProvider.mutate(provider.id)} className="min-h-11 rounded-full bg-ink px-4 text-sm text-white" disabled={selectProvider.isPending}>{selectProvider.isPending ? "Preparing request..." : "Select"}</button>
+                  <Button className="px-4" onClick={() => selectProvider.mutate(provider.id)} disabled={selectProvider.isPending}>{selectProvider.isPending ? "Preparing request..." : "Select"}</Button>
                 </div>
               </article>
             ))}
@@ -153,18 +137,14 @@ export default function TaskDetailPage() {
         </div>
       )}
       <div className="mt-6 flex gap-3">
-        <button onClick={() => action.mutate("complete")} className="min-h-11 rounded-full bg-ink px-5 text-white" disabled={action.isPending || ["COMPLETED", "CANCELLED"].includes(task.status)}>Complete</button>
-        <button onClick={() => action.mutate("cancel")} className="min-h-11 rounded-full border px-5" disabled={action.isPending || ["COMPLETED", "CANCELLED"].includes(task.status)}>Cancel</button>
+        <Button onClick={() => action.mutate("complete")} disabled={action.isPending || ["COMPLETED", "CANCELLED"].includes(task.status)}>Complete</Button>
+        <Button onClick={() => action.mutate("cancel")} variant="secondary" disabled={action.isPending || ["COMPLETED", "CANCELLED"].includes(task.status)}>Cancel</Button>
       </div>
+      </Card>
+      <Card>
       <h2 className="mt-8 text-xl font-semibold">Task history</h2>
-      <div className="mt-4 space-y-3">
-        {task.events.map((event) => (
-          <div key={event.id} className="rounded-2xl bg-mist p-4">
-            <p className="font-medium">{eventLabel(event.event_type)}</p>
-            <p className="text-sm text-gray-600">{event.message}</p>
-          </div>
-        ))}
-      </div>
+      <div className="mt-4">{task.events.length ? <Timeline events={task.events} /> : <EmptyState title="No history yet" />}</div>
+      </Card>
     </section>
   );
 }

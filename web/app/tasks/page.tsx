@@ -3,20 +3,7 @@
 import Link from "next/link";
 import { useQuery } from "@tanstack/react-query";
 import { apiFetch, getAccessToken, Task } from "@/lib/api";
-
-function statusLabel(status: string) {
-  const labels: Record<string, string> = {
-    DRAFT: "NOVA is preparing this task",
-    NEEDS_INFO: "NOVA needs one detail",
-    PLANNED: "NOVA has a plan",
-    WAITING_CONFIRMATION: "Review and confirm",
-    CONFIRMED: "Confirmed",
-    IN_PROGRESS: "In progress",
-    COMPLETED: "Done",
-    CANCELLED: "Cancelled",
-  };
-  return labels[status] || status.replaceAll("_", " ");
-}
+import { Card, EmptyState, ErrorState, LinkButton, LoadingState, PageHeader, StatusBadge } from "@/components/ui";
 
 function nextLabel(task: Task) {
   const serviceRequest = task.data?.service_request as { status?: string } | undefined;
@@ -29,24 +16,38 @@ function nextLabel(task: Task) {
 export default function TasksPage() {
   const hasToken = Boolean(getAccessToken());
   const { data, isLoading, error } = useQuery({ queryKey: ["tasks"], queryFn: () => apiFetch<Task[]>("/api/v1/tasks"), enabled: hasToken });
+  const groups = {
+    active: data?.filter((task) => !["COMPLETED", "CANCELLED"].includes(task.status)) ?? [],
+    done: data?.filter((task) => ["COMPLETED", "CANCELLED"].includes(task.status)) ?? [],
+  };
   return (
-    <section className="rounded-[2rem] bg-white p-6 shadow-soft">
-      <h1 className="text-3xl font-semibold">Tasks</h1>
-      {isLoading && <p className="mt-4">Preparing your tasks...</p>}
-      {(!hasToken || error) && <p className="mt-4 rounded-2xl bg-red-50 p-4 text-red-800">Login first to view tasks.</p>}
-      {data?.length === 0 && <p className="mt-6 rounded-3xl bg-mist p-6">No tasks yet. Tell NOVA what you need to get done.</p>}
-      <div className="mt-6 grid gap-4 md:grid-cols-2">
-        {data?.map((task) => (
-          <Link key={task.id} href={`/tasks/${task.id}`} className="rounded-3xl border border-gray-100 p-5 hover:border-calm">
-            <span className="rounded-full bg-mist px-3 py-1 text-xs">{statusLabel(task.status)}</span>
-            <h2 className="mt-3 text-xl font-semibold">{task.title}</h2>
-            <p className="mt-2 text-gray-600">{task.description}</p>
-            {task.due_date && <p className="mt-2 text-sm text-gray-500">Date: {task.due_date}</p>}
+    <section className="grid gap-5">
+      <PageHeader eyebrow="Execution" title="Tasks" description="Your confirmed NOVA work, grouped by what still needs attention." action={<LinkButton href="/chat">Create from chat</LinkButton>} />
+      {isLoading && <LoadingState label="Preparing your tasks..." />}
+      {!hasToken && <ErrorState title="Login first to view tasks." />}
+      {hasToken && error && <ErrorState message={error instanceof Error ? error.message : "Could not load tasks."} />}
+      {data?.length === 0 && <EmptyState title="No tasks yet" description="Tell NOVA what you need to get done and confirm the task when it understands." action={<LinkButton href="/chat" variant="secondary">Start a request</LinkButton>} />}
+      {groups.active.length > 0 && <TaskGroup title="Active work" tasks={groups.active} />}
+      {groups.done.length > 0 && <TaskGroup title="Completed or cancelled" tasks={groups.done} muted />}
+    </section>
+  );
+}
+
+function TaskGroup({ title, tasks, muted = false }: { title: string; tasks: Task[]; muted?: boolean }) {
+  return (
+    <Card>
+      <h2 className="text-xl font-semibold">{title}</h2>
+      <div className="mt-4 grid gap-4 md:grid-cols-2">
+        {tasks.map((task) => (
+          <Link key={task.id} href={`/tasks/${task.id}`} className="rounded-3xl border border-gray-100 p-5 transition hover:border-calm hover:bg-mist/40">
+            <div className="flex flex-wrap items-center justify-between gap-2"><StatusBadge status={task.status} />{task.due_date && <span className="text-xs text-gray-500">{task.due_date}</span>}</div>
+            <h3 className="mt-3 text-xl font-semibold">{task.title}</h3>
+            <p className={muted ? "mt-2 text-sm text-gray-500" : "mt-2 text-sm text-gray-600"}>{task.description}</p>
             {task.data?.entities?.location && <p className="mt-2 text-sm text-gray-500">Area: {task.data.entities.location}</p>}
             <p className="mt-3 text-sm font-medium text-ink">Next: {nextLabel(task)}</p>
           </Link>
         ))}
       </div>
-    </section>
+    </Card>
   );
 }

@@ -1,29 +1,25 @@
-import Link from "next/link";
+"use client";
 
-const adminNav = [
-  ["Dashboard", "/admin"],
-  ["Users", "/admin/users"],
-  ["Tasks", "/admin/tasks"],
-  ["Service requests", "/admin/service-requests"],
-  ["Providers", "/admin/providers"],
-  ["AI", "/admin/ai"],
-  ["Audit logs", "/admin/audit-logs"],
-];
+import React from "react";
+
+import { useRouter } from "next/navigation";
+import { useQuery } from "@tanstack/react-query";
+import { AdminShell, EmptyState, ErrorState, LinkButton, LoadingState } from "@/components/ui";
+import { ApiError, apiFetch, clearTokens, getAccessToken } from "@/lib/api";
+
+type Me = { email: string; role: string };
 
 export default function AdminLayout({ children }: { children: React.ReactNode }) {
+  const router = useRouter();
+  const hasToken = Boolean(getAccessToken());
+  const me = useQuery({ queryKey: ["admin-me"], queryFn: () => apiFetch<Me>("/api/v1/me"), enabled: hasToken, retry: false });
+  if (!hasToken || (me.error instanceof ApiError && me.error.status === 401)) return <EmptyState title="Admin login required" action={<LinkButton href="/login">Login</LinkButton>} />;
+  if (me.isLoading) return <LoadingState label="Checking admin access..." />;
+  if (me.error) return <ErrorState message={me.error.message} />;
+  if (me.data?.role !== "admin") return <ErrorState title="Access denied" message="An administrator account is required." />;
   return (
-    <section className="grid gap-5 lg:grid-cols-[220px_1fr]">
-      <aside className="rounded-[2rem] bg-ink p-4 text-white shadow-soft">
-        <h1 className="px-2 text-lg font-semibold">Admin</h1>
-        <nav className="mt-4 grid gap-1 text-sm" aria-label="Admin navigation">
-          {adminNav.map(([label, href]) => (
-            <Link key={href} href={href} className="rounded-2xl px-3 py-2 text-white/80 hover:bg-white/10 hover:text-white">
-              {label}
-            </Link>
-          ))}
-        </nav>
-      </aside>
-      <div>{children}</div>
-    </section>
+    <AdminShell adminEmail={me.data?.email} onLogout={() => { clearTokens(); router.push("/login"); }}>
+      {children}
+    </AdminShell>
   );
 }

@@ -10,7 +10,7 @@ def test_natural_request_to_task_completion(client, auth_headers):
     )
     assert first.status_code == 200, first.text
     assert first.json()["state"] == "needs_info"
-    assert "city or area" in first.json()["assistant_message"]["content"]
+    assert "Fi anéhi ville ou zone" in first.json()["assistant_message"]["content"]
 
     second = client.post(
         f"/api/v1/conversations/{conversation_id}/messages",

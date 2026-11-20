@@ -1,11 +1,25 @@
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+
+MAX_ATTACHMENT_BASE64_LENGTH = 6_990_508
 
 
 class UserCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     email: EmailStr
     password: str = Field(min_length=8, max_length=128)
     full_name: str | None = Field(default=None, max_length=160)
     locale: str = Field(default="en", max_length=16)
+
+    @field_validator("full_name")
+    @classmethod
+    def normalize_full_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Full name cannot be blank")
+        return normalized
 
 
 class UserLogin(BaseModel):
@@ -30,6 +44,7 @@ class UserOut(BaseModel):
     locale: str
     timezone: str
     role: str
+    created_at: str
 
 
 class UserUpdate(BaseModel):
@@ -54,6 +69,21 @@ class MessageOut(BaseModel):
     content: str
     data: dict
     created_at: str
+
+
+class AttachmentOut(BaseModel):
+    id: str
+    message_id: str
+    file_name: str
+    content_type: str
+    size_bytes: int
+    created_at: str
+
+
+class AttachmentCreate(BaseModel):
+    file_name: str = Field(min_length=1, max_length=255)
+    content_type: str = Field(min_length=1, max_length=120)
+    content_base64: str = Field(min_length=1, max_length=MAX_ATTACHMENT_BASE64_LENGTH)
 
 
 class ConversationOut(BaseModel):
@@ -85,12 +115,27 @@ class TaskCreate(BaseModel):
     data: dict = Field(default_factory=dict)
 
 
+class TaskDataUpdate(BaseModel):
+    """User-editable task metadata; workflow metadata remains server-owned."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_notes: str | None = Field(default=None, max_length=2000)
+
+
 class TaskUpdate(BaseModel):
-    title: str | None = Field(default=None, max_length=220)
-    description: str | None = Field(default=None, max_length=4000)
-    priority: str | None = Field(default=None, max_length=20)
+    title: str | None = Field(default=None, min_length=1, max_length=220)
+    description: str | None = Field(default=None, min_length=1, max_length=4000)
+    priority: str | None = Field(default=None, min_length=1, max_length=20)
     due_date: str | None = Field(default=None, max_length=80)
-    data: dict | None = None
+    data: TaskDataUpdate | None = None
+
+    @field_validator("title", "description", "priority", "data", mode="before")
+    @classmethod
+    def reject_explicit_null_for_required_updates(cls, value: object) -> object:
+        if value is None:
+            raise ValueError("This field cannot be null")
+        return value
 
 
 class TaskEventOut(BaseModel):
@@ -244,6 +289,8 @@ class AdminPage(BaseModel):
     limit: int
     offset: int
     total: int
+    page: int
+    page_count: int
 
 
 class AdminDashboardOut(BaseModel):
@@ -259,3 +306,10 @@ class AdminDashboardOut(BaseModel):
     clarification_events: int
     fallback_events: int
     unavailable_metrics: list[str]
+
+
+class AdminIntelligenceOut(BaseModel):
+    period_days: int
+    ai: dict
+    trends: list[dict]
+    intentions: list[dict]

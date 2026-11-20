@@ -1,8 +1,10 @@
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -14,6 +16,58 @@ from app.seed import seed_demo_data
 
 logger = logging.getLogger("nova.api")
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{8,80}$")
+ATTACHMENT_PATH_PATTERN = re.compile(r"^/api/v1/messages/[^/]+/attachments$")
+
+
+class RequestBodyTooLarge(Exception):
+    pass
+
+
+class AttachmentBodyLimitMiddleware:
+    def __init__(self, app: Callable, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: dict, receive: Callable[[], Awaitable[dict]], send: Callable[[dict], Awaitable[None]]) -> None:
+        if scope.get("type") != "http" or scope.get("method") != "POST" or not ATTACHMENT_PATH_PATTERN.fullmatch(scope.get("path", "")):
+            await self.app(scope, receive, send)
+            return
+        headers = {key.lower(): value for key, value in scope.get("headers", [])}
+        content_length = headers.get(b"content-length")
+        if content_length is not None:
+            try:
+                if int(content_length.decode()) > self.max_bytes:
+                    await self._reject(scope, receive, send)
+                    return
+            except ValueError:
+                await self._reject(scope, receive, send)
+                return
+        received = 0
+
+        async def limited_receive() -> dict:
+            nonlocal received
+            message = await receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    raise RequestBodyTooLarge
+            return message
+
+        try:
+            await self.app(scope, limited_receive, send)
+        except RequestBodyTooLarge:
+            await self._reject(scope, receive, send)
+
+    async def _reject(self, scope: dict, receive: Callable[[], Awaitable[dict]], send: Callable[[dict], Awaitable[None]]) -> None:
+        request_id = ""
+        for key, value in scope.get("headers", []):
+            if key.lower() == b"x-request-id":
+                request_id = value.decode(errors="ignore")
+                break
+        if not REQUEST_ID_PATTERN.fullmatch(request_id):
+            request_id = str(uuid4())
+        response = error_response(413, "ATTACHMENT_TOO_LARGE", "This file is too large.", request_id)
+        await response(scope, receive, send)
 
 
 def request_id_from(request: Request) -> str:
@@ -44,6 +98,7 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.add_middleware(AttachmentBodyLimitMiddleware, max_bytes=settings.attachment_max_request_bytes)
 
     @app.middleware("http")
     async def request_id_middleware(request: Request, call_next):
@@ -84,7 +139,7 @@ def create_app() -> FastAPI:
             "VALIDATION_ERROR",
             "I couldn't complete this request. Please check the information and try again.",
             request_id,
-            exc.errors(),
+            jsonable_encoder(exc.errors()),
         )
 
     @app.exception_handler(Exception)

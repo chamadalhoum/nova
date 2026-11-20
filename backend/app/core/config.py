@@ -21,6 +21,11 @@ class Settings(BaseSettings):
     ai_model: str | None = None
     ai_timeout_seconds: float = 30.0
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
+    attachment_storage_dir: str = "uploads/attachments"
+    attachment_max_bytes: int = 5 * 1024 * 1024
+    attachment_max_request_bytes: int = 7_000_000
+    attachment_max_per_message: int = 4
+    attachment_user_storage_quota_bytes: int = 50 * 1024 * 1024
 
     @model_validator(mode="after")
     def reject_default_jwt_secrets_outside_dev(self) -> "Settings":
